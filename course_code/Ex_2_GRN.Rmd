@@ -1,0 +1,420 @@
+---
+title: "SCENIC-mediated GRN building"
+output: html_document
+date: "2025-11-27"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# GRN inference from transcriptomic and accesibility genomic data
+
+In this exercise we will explore how to build GRN from bulk or sc-RNAseq and ATACseq data.
+
+The session is designed following the workflow of the **SCENIC** ecosystem ([scenic.aertslab.org](https://scenic.aertslab.org/){.uri}) and has been adapted to low computational requirements.
+
+Basically we will build a transcription-based network, then a cis-regulatory network will be loaded to the session, exploring how this was built, and finally we will merge these two informative datasets to obtain a strongly supported GRN, being able to
+
+![SCENIC workflow](~/NT-evo-devo/pic/scenic_workflow_v2.png){width="500"}
+
+#### Scientific background
+
+![The mayfly *C. dipterum* (DOI: 10.1038/s41467-020-16284-8)](~/NT-evo-devo/pic/mayfly_f1.png){width="500"}
+
+#### Session Set up
+
+All the guidelines for installation of the required packages are in <https://htmlpreview.github.io/?https://github.com/aertslab/SCENIC/blob/master/inst/doc/SCENIC_Setup.html>
+
+```{r installation}
+
+## 0) Identify available resources
+system("nproc", intern = TRUE)
+
+## 1) Installation of basic tools
+if (!requireNamespace("BiocManager", quietly = TRUE))
+  install.packages("BiocManager")
+if (!requireNamespace("remotes", quietly = TRUE))
+  install.packages("remotes")
+if (!requireNamespace("devtools", quietly = TRUE))
+  install.packages("devtools")
+
+library(devtools)
+library(remotes)
+
+## 2) Bioconductor version
+
+BiocManager::install(version = "3.16", update = TRUE, ask = FALSE)
+
+
+## 3) arrow with support for compressed zstd files
+Sys.setenv(ARROW_WITH_ZSTD="ON")
+install.packages("arrow", type="source") # takes A LOT OF TIME
+
+## 4) Installation of all SCENIC dependencies
+remotes::install_version("feather", version = "0.3.5", repos = "https://cloud.r-project.org")
+devtools::install_github("aertslab/SCopeLoomR", build_vignettes = TRUE)
+devtools::install_github("aertslab/AUCell") #v 1.25.2
+devtools::install_github("aertslab/GENIE3")#v 1.20.0
+devtools::install_version("matrixStats", version = "0.61.0", repos = "https://cloud.r-project.org")
+devtools::install_github("aertslab/SCENIC@v1.1.2") ##no actualizar nada al instalar!!!
+devtools::install_github("aertslab/RcisTarget") #v 1.18.2
+install.packages("anndata")
+install.packages("reticulate")
+remotes::install_github("mojaveazure/seurat-disk")
+```
+
+Once the packages are correctly installed, load them to the session and check the installled version:
+
+```{r}
+## 5) Loading and version corroboration
+  
+library(Seurat)
+library(reticulate)
+library(anndata)
+library(matrixStats); packageVersion("matrixStats")  
+library(AUCell);      packageVersion("AUCell")
+library(SCopeLoomR); packageVersion("SCopeLoomR")  
+library(GENIE3);      packageVersion("GENIE3")
+library(feather); packageVersion("feather")  
+library(SCENIC);      packageVersion("SCENIC")
+library(RcisTarget); packageVersion("RcisTarget")
+
+```
+
+## 2.1 Network inference through co-expression modules
+
+We will first generate a
+
+### 2.1.1 Preparation of expression data
+
+Load mayfly eye scRNA-seq data (h5ad) and create Seurat object.
+
+```{r}
+
+# Read the h5ad file using zellkonverter
+data_sce <- read_h5ad("evodevo2025/nymph3_eye.h5ad")
+
+# Create a Seurat object from counts (transpose: genes x cells)
+data <- CreateSeuratObject(
+  counts       = t(as.matrix(data_sce$X)),
+  meta.data    = data_sce$obs,
+  min.features = 100,
+  min.cells    = 10
+)
+
+# Quick exploration
+dim(GetAssayData(data, slot = "counts"))  # genes x cells
+head(data@meta.data)
+colnames(data@meta.data)
+
+```
+
+Extract the expression matrix, with normalized counts.
+
+```{r}
+
+countsMat <- GetAssayData(data, slot = "counts")   # raw counts
+dim(countsMat)
+
+data <- NormalizeData(data)  # log-normalized
+data <- FindVariableFeatures(data, nfeatures = 2000)
+data <- ScaleData(data, features = VariableFeatures(data))
+data <- FindNeighbors(data, dims = 1:20)
+data <- FindClusters(data, resolution = 0.5)
+data <- RunUMAP(data, dims = 1:20, reduction.name = "umap",
+                reduction.key = "UMAP_")
+
+
+
+Reductions(data)
+
+# Expression matrix in log-normalized space
+exprMat <- GetAssayData(data, slot = "data")
+exprMat_dense <- as.matrix(exprMat)
+
+# Harmonize gene IDs: replace "-" with "_" (important for downstream tools)
+rownames(exprMat_dense) <- gsub("-", "_", rownames(exprMat_dense))
+
+```
+
+### 2.1.2 Loading of TF in mayfly
+
+The TF from mayfly have been defined through orthology, as recommendend in....
+
+These TF have to have a defined binding profile.
+
+```{r}
+
+tfs <- read.table("evodevo2025/clodip_v4_TF.txt",
+                  header = FALSE, sep = "\t",
+                  stringsAsFactors = FALSE)
+tfList <- tfs$V1
+
+# Explore the TF list
+length(tfList)
+head(tfs)
+
+# Keep only TFs that are actually present in the expression matrix
+tfList <- intersect(tfList, rownames(exprMat_dense))
+length(tfList)
+
+```
+
+### 2.1.3 Co-expression modules through GENIE3
+
+The coexpression modules will be generated usinig **GENIE3** ([https://github.com/vahuynh/GENIE3)](https://github.com/vahuynh/GENIE3).) over the normalized expression matrix.
+
+Developed originally for bulk transcriptional data, GENIE3 computes the regulatory network for each gene independently. It uses tree-based ensemble methods such as random forests to predict the expression profile of each target gene from profiles of all the other genes. The weight of an interaction comes from the importance of an input gene in the predictor for a target gene’s expression pattern. Aggregating these weighted interactions over all the genes yields the regulatory network. An adaptation to sc data can be found under the name of GRNBoost2.
+
+This method was the top performer in the DREAM4 in silico network challenge (multifactorial subchallenge). GENIE3 was also shown to be a good model for Network prediction: <https://www.nature.com/articles/s41592-019-0690-6>
+
+```{r}
+set.seed(123)
+
+weightMat <- GENIE3(exprMat_dense,
+                    regulators = tfList,
+                    nTrees     = 100,    
+                    nCores     = 8)
+
+    dim(weightMat)   # genes x TFs
+
+# Convert weight matrix to ranked list of edges
+linkList <- getLinkList(weightMat)
+    head(linkList)
+
+# Inspect distribution of weights
+hist(linkList$weight, breaks = 100,
+     main = "Weighted distribution from GENIE3")
+
+# Threshold edges at the 95th percentile
+percentile_95 <- quantile(linkList$weight, 0.95)
+filt <- linkList[linkList$weight > percentile_95, ]
+    dim(filt)
+```
+
+With now some data.frame rearrangements we can build TF-centered modules from the filtered edges.
+
+These way of organising the information will be usefull for later analysis.
+
+```{r}
+#Build TF modules (TF → list of target genes)
+
+minTargets <- 20   
+maxTargets <- 200
+
+tfModules <- filt %>% group_by(regulatoryGene) %>%
+  summarise(targets = list(unique(targetGene)[1:min(maxTargets, n())])) %>%
+  ungroup() %>% filter(lengths(targets) >= minTargets)
+
+        length(tfModules$regulatoryGene)
+
+# Convert to a named list for RcisTarget: geneSets[[TF]] = vector of targets
+geneSets <- setNames(tfModules$targets, as.character(tfModules$regulatoryGene))
+        
+        length(geneSets)
+        str(geneSets[1:3])
+
+```
+
+## 2.2 Motif enrichment with RcisTarget
+
+We will integrate sequence-level information by identifying transcription factor **binding motifs** enriched **among the target genes** of each **TF module**.
+
+Using a custom motif ranking database for the mayfly genome, we test which motifs (and therefore which TFs) **support the co-expression modules** inferred by GENIE3. This step adds regulatory evidence beyond correlation.
+
+#### Mayfly motif ranking database
+
+The custom motif-ranking database of mayfly has been built following a workflow based on genome-wide motif scanning using **Cluster-Buster** ([DOI:[10.1002/neu.480230907](DOI:%5B10.1002/neu.480230907){.uri}](#0) , <https://resources.aertslab.org/cistarget/> ).
+
+In this approach, each **TF motif is mapped across the genome** to identify all potential binding sites, and Cluster-Buster assigns **scores to** **motif clusters** within defined regulatory regions (typically promoters or extended gene regulatory domains). These scores are then transformed into *rankings* that order genes by the likelihood of being regulated by each motif. The resulting “motif-ranking database” is stored in feather format and used by RcisTarget to perform enrichment analysis.
+
+Load the cis-regulatory database and the corresponding annotations.
+
+```{r}
+dbFile <-"evodevo2025/clodip_v4.genes_vs_motifs.rankings.feather"
+motifRankings <- importRankings(dbFile)  
+
+      head(getRanking(motifRankings)[,1:5])
+
+
+annotFile <- "evodevo2025/clodip_v4_motif2TF.txt"  
+
+motifAnnotations <- importAnnotations( annotFile = annotFile,
+                                      motifsInRanking = getRanking(motifRankings)$features)
+
+    head(motifAnnotations)
+
+
+```
+
+#### Motif enrichment analysis
+
+Run the motif enrichment over all TF modules:
+
+```{r}
+
+
+motifEnr <- RcisTarget::cisTarget(
+  geneSets       = geneSets,
+  motifRankings  = motifRankings,
+  motifAnnot     = motifAnnotations_mgi,
+  nesThreshold   = 3.0,
+  aucMaxRank     = 0.05 * ncol(motifRankings),  # equivalente a tu idea de 5%
+  nCores         = 8,
+  verbose        = TRUE
+)
+
+motifEnr
+motifEnr_df <- as.data.frame(motifEnr)
+
+```
+
+### 2.....Getting regulons
+
+Here we combine the results of GENIE3 and RcisTarget: for each TF, we intersect its co-expression targets with the motif-supported targets to define a “regulon.” Regulons represent high-confidence TF-driven gene programs supported both by expression patterns and regulatory motif enrichment.
+
+```{r}
+
+
+getRegulonFromMotifs <- function(tfName, geneSets, motifEnr, topMotifs = 5) {
+                          # Co-expression module for this TF
+                                  gs <- geneSets[[tfName]]
+                                  if (is.null(gs)) return(NULL)
+                          
+                          # Motif enrichment entries for this TF
+                                  enr_tf <- motifEnr_df[motifEnr_df$geneSet == tfName, , drop = FALSE]
+                            
+                          # Top motifs by NES
+                                  enr_tf <- enr_tf[order(-enr_tf$NES), ][1:min(topMotifs, nrow(enr_tf)), ]                          
+                          # Extract enriched genes (semicolon-separated) and flatten
+                                  motifTargets <- enr_top$enrichedGenes |>  strsplit(";") |> unlist() |>  unique()
+                          
+                          # Regulon = genes in the TF’s module AND supported by motifs
+                                  regulonGenes <- intersect(gs, motifTargets)
+                                  if (!length(regulonGenes)) return(NULL)
+  
+                           regulonGenes
+                          }
+
+regulons <- lapply(names(geneSets), getRegulonFromMotifs,
+                   geneSets = geneSets, motifEnr = motifEnr, topMotifs = 5)
+
+names(regulons) <- names(geneSets)
+regulons <- regulons[!vapply(regulons, is.null, logical(1))]
+regulons <- regulons[lengths(regulons) > 0]
+
+
+length(regulons)
+str(regulons[1:3])
+
+
+```
+
+Interesting TF:
+
+We identify specific transcription factors associated with known biological processes—such as neurogenesis, retinal development and sexual differentiation—based on literature and annotation. These TFs form a curated set of candidate regulators whose activity we will later explore and visualize.
+
+```{r}
+
+regulatory_candidates <- data.frame(
+  dmel_gene = c("hth","Ets98B","run","Hr51","CG32006","Rcd2","CG4591","CG9573","CG34148","Mkp3","CG8312"),
+  clodip_v4 = c("clodip_v4_11699","clodip_v4_3957","clodip_v4_6378","clodip_v4_5141", "clodip_v4_2405","clodip_v4_6897","clodip_v4_3896", "clodip_v4_13111","clodip_v4_13884","clodip_v4_14917","clodip_v4_8817"),
+  stringsAsFactors = FALSE
+)
+
+reg_vec<-regulatory_candidates$clodip_v4
+
+```
+
+### 2.3 Quantifying regulon activity with AUCell
+
+**AUCell scores** how active **each regulon is in each individual cell** by computing the enrichment of regulon genes within the top-expressed genes of each cell. This produces a regulon-by-cell activity matrix, enabling direct comparison of regulatory programs across clusters, sexes or developmental stages.
+
+```{r}
+
+
+cells_rankings <- AUCell_buildRankings(exprMat_dense)
+regulonAUC     <- AUCell_calcAUC(regulons, cells_rankings, nCores = 8)
+regulonAUC_mat <- getAUC(regulonAUC)
+dim(regulonAUC_mat)
+
+
+```
+
+## 2.4 Visualization of regulatory activity
+
+Finally, we visualize the activity of selected regulons. UMAP plots colored by AUC values highlight spatial patterns of TF activity across cellular states, while heatmaps allow comparison of regulon activity across groups such as cell types or sexes. Together, these visualizations help interpret the regulatory landscape of the dataset.
+
+```{r}
+
+reg <- "clodip_v4_961"
+auc_vec <- regulonAUC_mat[reg, colnames(data)]
+      range(auc_vec, na.rm = TRUE)
+      length(unique(auc_vec))
+
+
+emb <- Embeddings(data, "umap")  
+
+df <- data.frame(
+            UMAP_1 = emb[, 1],
+            UMAP_2 = emb[, 2],
+            AUC    = as.numeric(auc_vec)
+          )
+
+
+par(mar = c(4, 4, 2, 1))
+pal    <- colorRampPalette(c("#FFFFBF", "#FDAE61", "#D7191C"))
+nCols  <- 100
+cols   <- pal(nCols)
+
+auc_range  <- range(df$AUC, na.rm = TRUE)
+auc_breaks <- seq(auc_range[1], auc_range[2], length.out = nCols)
+col_index  <- findInterval(df$AUC, auc_breaks, all.inside = TRUE)
+pt_cols    <- cols[col_index]
+
+plot(df$UMAP_1, df$UMAP_2, col  = pt_cols, pch  = 16,  cex  = 1.2, main = reg, xlab = "UMAP_1",  ylab = "UMAP_2")
+
+```
+
+Heatmap
+
+```{r}
+install.packages(pheatmap)
+library(pheatmap)
+
+# 1) Elegir regulones a representar (por ejemplo los 30 más variables)
+regVar   <- apply(regulonAUC_mat, 1, var)
+selRegs  <- names(sort(regVar, decreasing = TRUE))[1:30]
+mat      <- regulonAUC_mat[selRegs, , drop = FALSE]
+
+
+
+meta_sub <- data@meta.data[colnames(mat), , drop = FALSE]
+
+annotation_col <- data.frame(
+  cell_type_vs = meta_sub$cell_type_vs,
+  sex          = meta_sub$sex
+)
+rownames(annotation_col) <- colnames(mat)
+
+
+cell_order <- order(annotation_col$cell_type_vs)
+
+# 3) Heatmap
+
+mat2 <- regulonAUC_mat[reg_vec, , drop = FALSE]
+
+pheatmap(
+  mat2[, cell_order],
+  cluster_rows   = TRUE,
+  cluster_cols   = FALSE,
+  show_rownames  = TRUE,
+  show_colnames  = FALSE,
+  scale          = "row",
+  annotation_col = annotation_col
+)
+
+
+
+```
