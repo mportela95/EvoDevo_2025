@@ -1,0 +1,508 @@
+---
+title: "Gene regulatory networks"
+author: "Marta Portela"
+date: "2025-11-28"
+output:
+  pdf_document: default
+  html_document: default
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message=FALSE,  eval = FALSE,warning=FALSE, results='hide')
+```
+
+# GRN inference from transcriptomic and accesibility genomic data
+
+In this exercise we will explore how to build GRN from bulk or sc-RNAseq and ATACseq data.
+
+The session is designed following the workflow of the **SCENIC** ecosystem ([scenic.aertslab.org](https://scenic.aertslab.org/){.uri}) and has been adapted to low computational requirements.
+
+Basically we will build a transcription-based network, then a cis-regulatory network will be loaded to the session, exploring how this was built, and finally we will merge these two informative datasets to obtain a strongly supported GRN, being able to identify which of the defined regulons (units of regulation based on TFs) are active in each cell and in whic level.
+
+![SCENIC workflow](pic/scenic_workflow_v2.png){width="500"}
+
+#### Scientific background
+
+We will take advantage of the genomic and transcriptomic data generated from males and females mayflies, which develop sex-dependent diverse neural and optical structures.
+
+![The mayfly *C. dipterum* (DOI: 10.1038/s41467-020-16284-8)](../pic/mayfly_f1.png){width="500"}
+
+#### Session Set up
+
+All the guidelines for installation of the required packages are in <https://htmlpreview.github.io/?https://github.com/aertslab/SCENIC/blob/master/inst/doc/SCENIC_Setup.html>
+
+```{r installation}
+
+## Identify available resources
+system("nproc", intern = TRUE)
+
+## Install minimal required packages
+
+install.packages("doRNG")
+install.packages("doParallel")
+install.packages("pheatmap")
+install.packages("igraph")
+install.packages("ggraph")
+# GENIE3, AUCell, RcisTarget from GitHub
+install.packages("pak")
+
+pak::pkg_install(c(
+  "bioc::AUCell",
+  "bioc::RcisTarget",
+  "bioc::GENIE3"))
+```
+
+Once the packages are correctly installed, load them to the session and check the installled version:
+
+```{r}
+library(doRNG)
+library(doParallel)
+library(AUCell);      packageVersion("AUCell")
+library(GENIE3);      packageVersion("GENIE3")
+library(RcisTarget); packageVersion("RcisTarget")
+library(pheatmap)
+library(dplyr)
+```
+
+## 1 Network inference through co-expression modules
+
+We will first generate a co-expression network based on the expression dataset, obteined from a sc-RNAseq of male and female mayflies.
+
+### 1.1 Preparation of expression data
+
+Load an already extracted normalized expression matrix from mayfly eye scRNA-seq data and its metadata.
+
+```{r}
+exprMat_dense <- readRDS("data/ex2/exprMat_nymph3_eye_SCENIC_80-5.rds")
+meta          <- readRDS("data/ex2/meta_nymph3_eye_SCENIC_80-5.rds")
+umap          <- readRDS("data/ex2/umap_nymph3_eye_SCENIC_80-5.rds")
+
+dim(exprMat_dense)
+head(meta)
+colnames(meta)
+
+```
+
+1.  What do the two numbers returned by dim(exprMat_dense) represent?
+
+2.  Inspect colnames(meta). Which columns look informative to compare regulatory activity between cell types or sexes?
+
+Note: As you can apreciate, bulk expression data can be loaded if following the same format, indicating samples in the place of cells.
+
+### 1.2 Loading of TF in mayfly
+
+The mayfly TFs have been defined through orthology and filtered to ensure they have defined binding profiles (motifs) in the custom database.
+
+```{r}
+
+tfs <- read.table("data/ex2/clodip_v4_TF.txt",
+                  header = FALSE, sep = "\t",
+                  stringsAsFactors = FALSE)
+tfList <- tfs$V1
+
+# Explore the TF list
+length(tfList)
+head(tfs)
+
+# Keep only TFs that are actually present in the expression matrix
+tfList <- intersect(tfList, rownames(exprMat_dense))
+length(tfList)
+
+```
+
+1.  Compare the number of TFs before and after the `intersect` step. How many TFs are actually expressed in this dataset?
+
+### 1.3 Co-expression modules through GENIE3
+
+The coexpression modules will be generated usinig **GENIE3** ([https://github.com/vahuynh/GENIE3)](https://github.com/vahuynh/GENIE3).) over the normalized expression matrix.
+
+Developed originally for bulk transcriptional data, GENIE3 computes the regulatory network for each gene independently. It uses tree-based ensemble methods such as random forests to predict the expression profile of each target gene from profiles of all the other genes. The weight of an interaction comes from the importance of an input gene in the predictor for a target gene’s expression pattern. Aggregating these weighted interactions over all the genes yields the regulatory network. An adaptation to sc data can be found under the name of GRNBoost2.
+
+This method was the top performer in the DREAM4 in silico network challenge (multifactorial subchallenge). GENIE3 was also shown to be a good model for Network prediction: <https://www.nature.com/articles/s41592-019-0690-6>
+
+```{r}
+set.seed(123)
+
+weightMat <- GENIE3(exprMat_dense,
+                    regulators = tfList,
+                  #  nTrees     = 10,    
+                    nCores     = 2)
+
+    dim(weightMat)   # genes x TFs
+
+# Convert weight matrix to ranked list of edges
+linkList <- getLinkList(weightMat)
+    head(linkList)
+
+# Inspect distribution of weights
+hist(linkList$weight, breaks = 100,
+     main = "Weighted distribution from GENIE3")
+
+# Threshold edges at the 95th percentile
+percentile_95 <- quantile(linkList$weight, 0.95)
+filt <- linkList[linkList$weight > percentile_95, ]
+    dim(filt)
+
+    
+#If the analysis cannot be performed, load the output to continue:
+       # filt<- read.table("data/linkList95_Genie3.txt", header = TRUE )    
+    
+  
+```
+
+1.  What do the rows and columns of weightMat represent?
+
+2.  Inspect head(linkList): identify which columns correspond to TF, target gene and interaction weight.
+
+3.  Look at the histogram of weights: is the distribution uniform, skewed, long-tailed…? What does that tell you about the number of strong vs. weak interactions?
+
+With now some data.frame rearrangements we can build TF-centered modules from the filtered edges.
+
+These way of organising the information will be usefull for later analysis.
+
+```{r}
+#Build TF modules (TF → list of target genes)
+
+minTargets <- 20   
+maxTargets <- 200
+
+tfModules <- filt %>% group_by(regulatoryGene) %>%
+  summarise(targets = list(unique(targetGene)[1:min(maxTargets, n())])) %>%
+  ungroup() %>% filter(lengths(targets) >= minTargets)
+
+        length(tfModules$regulatoryGene)
+
+# Convert to a named list for RcisTarget: geneSets[[TF]] = vector of targets
+geneSets <- setNames(tfModules$targets, as.character(tfModules$regulatoryGene))
+        
+        length(geneSets)
+        str(geneSets[1:3])
+
+```
+
+## 2 Motif enrichment with RcisTarget
+
+We now integrate sequence-level information by identifying transcription factor **binding motifs** enriched **among the target genes** of each **TF module**.
+
+Using a custom motif ranking database for the mayfly genome, we test which motifs (and therefore which TFs) **support the co-expression modules** inferred by GENIE3. This step adds regulatory evidence beyond correlation.
+
+#### Mayfly motif ranking database
+
+The custom motif-ranking database of mayfly has been built following a workflow based on genome-wide motif scanning using **Cluster-Buster** ([DOI:[10.1002/neu.480230907](DOI:%5B10.1002/neu.480230907){.uri}](#0) , <https://resources.aertslab.org/cistarget/> ).
+
+In this approach, each **TF motif is mapped across the genome** to identify all potential binding sites, and Cluster-Buster assigns **scores to** **motif clusters** within defined regulatory regions (typically promoters or extended gene regulatory domains). These scores are then transformed into *rankings* that order genes by the likelihood of being regulated by each motif. The resulting “motif-ranking database” is stored in feather format and used by RcisTarget to perform enrichment analysis.
+
+Load the cis-regulatory database and the corresponding annotations.
+
+```{r}
+dbFile <-"data/ex2/clodip_v4.genes_vs_motifs.rankings.feather"
+motifRankings <- importRankings(dbFile)  
+
+      head(getRanking(motifRankings)[,1:5])
+
+
+motifAnnotations <- read.table("data/ex2/motif_Annotations_clodip.txt", header = TRUE, sep = "\t")
+    head(motifAnnotations)
+```
+
+1.  In `getRanking(motifRankings)[, 1:5]`, what are rows and columns representing?
+2.  In head(motifAnnotations), what information are we recovering?
+3.  Which is the strongest link from these rows and columns?
+
+## 3 GRNs integration
+
+#### 3.1 Motif enrichment analysis
+
+In this step, we use **RcisTarget** to test whether each **gene** **module** inferred from GENIE3 data is **supported** by **cis-regulatory** evidence. For every gene set (e.g., a TF’s predicted targets), cisTarget() evaluates motif enrichment by checking whether the genes in the set are disproportionately represented near the top of precomputed motif-based rankings. Enrichment is quantified using an AUC-based recovery curve and summarized as a normalized enrichment score (NES), allowing us to identify motifs (and associated TF families) that best explain the module.
+
+```{r}
+
+
+motifEnr <- RcisTarget::cisTarget(
+  geneSets       = geneSets,
+  motifRankings  = motifRankings,
+  motifAnnot     = motifAnnotations,
+  nesThreshold   = 3.0,
+  aucMaxRank     = 0.1 * ncol(motifRankings), 
+  nCores         = 2,
+  verbose        = TRUE
+)
+fin <- Sys.time()
+motifEnr
+motifEnr_df <- as.data.frame(motifEnr)
+
+
+# If the analysis cannot be performed, load the output to continue:
+  # motifEnr_df<- read.table("data/out_motifEnrichdb.txt", header = TRUE, sep = "\t")
+
+```
+
+1.  Inspect head(motifEnr_df). Which columns tell you “how strong” the enrichment is?
+
+2.  What information is contained in the enrichedGenes column? Why is this useful for building regulons?
+
+### 3.2 **Regulon construction and pruning**
+
+We convert motif enrichment results into **pruned regulons**. The idea is to retain only those predicted target genes that have direct cis-regulatory support: we intersect the original co-expression–derived gene module with the “leading-edge” genes driving motif enrichment (typically selecting top motifs by NES and/or motifs annotated to the TF). This pruning step reduces false positives from expression-only inference and yields a more biologically plausible TF→target regulon.
+
+Regulons represent high-confidence TF-driven gene programs supported both by expression patterns and regulatory motif enrichment.
+
+*Note: The following code is an adaptation to mimic the original code from SCENIC, but does not perform the exact same analysis.*
+
+```{r}
+
+
+getRegulonFromMotifs <- function(tfName, geneSets, motifEnr_df, topMotifs = 5) {
+                          # Co-expression module for this TF
+                                  gs <- geneSets[[tfName]]
+                                  if (is.null(gs)) return(NULL)
+                          
+                          # Motif enrichment entries for this TF
+                                  enr_tf <- motifEnr_df[motifEnr_df$geneSet == tfName, , drop = FALSE]
+                            
+                          # Top motifs by NES
+                                  enr_top <- enr_tf[order(-enr_tf$NES), ][1:min(topMotifs, nrow(enr_tf)), ]                          
+                          # Extract enriched genes (semicolon-separated) and flatten
+                                  motifTargets <- enr_top$enrichedGenes |>  strsplit(";") |> unlist() |>  unique()
+                          
+                          # Regulon = genes in the TF’s module AND supported by motifs
+                                  regulonGenes <- intersect(gs, motifTargets)
+                                  if (!length(regulonGenes)) return(NULL)
+  
+                           regulonGenes
+                          }
+
+regulons <- lapply(names(geneSets), getRegulonFromMotifs,
+                   geneSets = geneSets, motifEnr = motifEnr_df, topMotifs = 5)
+
+names(regulons) <- names(geneSets)
+regulons <- regulons[!vapply(regulons, is.null, logical(1))]
+regulons <- regulons[lengths(regulons) > 0]
+
+
+length(regulons)
+str(regulons[1:3])
+
+
+```
+
+1.  Compare the definition of a TF module (from GENIE3) and a regulon (GENIE3 + RcisTarget). What extra evidence do regulons require?
+
+2.  Why do we only keep the top topMotifs by NES when building regulons? What could happen if we included all motifs regardless of NES?
+
+## 3.3 Quantifying regulon activity with AUCell
+
+Finally, we quantify **regulon activity at the single-cell level** using AUCell. After ranking genes by expression within each cell, `AUCell_calcAUC()` computes an AUC score that reflects whether a regulon’s target genes are enriched among the top-expressed genes in that cell. The output is a regulon-by-cell matrix of AUC values, which can be visualized directly or binarized using regulon-specific thresholds to define ON/OFF regulon activity across cell types.
+
+The regulon-by-cell activity matrix, enabling direct comparison of regulatory programs across clusters, sexes or developmental stages.
+
+```{r}
+
+cells_rankings <- AUCell_buildRankings(exprMat_dense, useNames=FALSE)
+regulonAUC     <- AUCell_calcAUC(regulons, 
+                                 cells_rankings, 
+                                 nCores = 2)
+regulonAUC_mat <- getAUC(regulonAUC)
+
+dim(regulonAUC_mat)
+
+
+# If the analysis cannot be performed, load the output to continue:
+  # regulonAUC_mat<- read.table("data/out_regulonAUC_mat.txt", header = TRUE, sep = "\t")
+
+annot<-read.table("data/ex2/AnnotCdipV1_FlybaseSymbol_clodipv4.tsv", col.names = c("CD", "merge", "clodip"))
+    gene_map <- setNames(annot$merge, annot$clodip)
+    
+    keep <- intersect(rownames(regulonAUC_mat), names(gene_map))
+    
+    regulonAUC_mat_annot <- regulonAUC_mat[keep, , drop = FALSE]
+    rownames(regulonAUC_mat_annot) <- make.unique(unname(gene_map[keep]))
+
+```
+
+1.  What do the rows and columns of regulonAUC_mat represent?
+
+2.  How would you interpret a cell with a very high AUC for a given regulon? And a very low AUC?
+
+#### Active or not active? Setting thresholds for each regulon
+
+For each regulon individually,in is determined an **AUC threshold** that separates two populations of cells: those in which the **regulon is active** (AUC above the threshold → 1) and those in which it is **inactive** (AUC below the threshold → 0). This threshold is estimated using AUCell’s AUCell_exploreThresholds, which examines the regulon’s AUC distribution, identifies an inflection point (“knee”), and proposes a data-driven cutoff. Because each regulon can span different dynamic ranges, thresholds are computed per regulon rather than globally. Conceptually, significance is interpreted as the presence of a distinct subset of cells with high regulon activity, and the threshold marks the transition between background and the high-AUC tail.
+
+```{r}
+
+# 1) Set individual regulon thresholds
+regulonThresholds <- AUCell_exploreThresholds(
+          regulonAUC,
+          plotHist = FALSE,  
+          assign   = TRUE     
+        )
+
+# 2) Binary matrix generation: a regulon is active/inactive in each cell
+
+# Generation of the empty scaffolded matrix
+regulonBin_mat <- matrix(
+                    0L,
+                    nrow = nrow(regulonAUC_mat),
+                    ncol = ncol(regulonAUC_mat),
+                    dimnames = dimnames(regulonAUC_mat))
+
+# Assignment of 1 to the cells that have an AUC for that regulon over the threshold
+
+for (reg in names(regulonThresholds)) {
+  assigned_cells <- regulonThresholds[[reg]]$assignment
+  
+  #if a regulon is not active in any cells, we keep it
+  if (length(assigned_cells) == 0) next
+  
+  regulonBin_mat[reg, assigned_cells] <- 1L
+}
+
+# Convertion to numeric
+regulonBin_mat <- apply(regulonBin_mat, 2, as.numeric)
+rownames(regulonBin_mat) <- rownames(regulonAUC_mat_annot)
+
+```
+
+## 4 Visualization of regulatory activity
+
+Finally, we visualize the activity of selected regulons. UMAP plots colored by AUC values highlight spatial patterns of TF activity across cellular states, while heatmaps allow comparison of regulon activity across groups such as cell types or sexes. Together, these visualizations help interpret the regulatory landscape of the dataset.
+
+```{r}
+reg <- "clodip_v4_10094"
+
+# Ensure consistent cell order
+cells   <- colnames(exprMat_dense)
+auc_vec <- regulonAUC_mat[reg, cells]
+
+emb  <- umap[cells, , drop = FALSE]
+df <- data.frame(
+  UMAP_1 = emb[, 1],
+  UMAP_2 = emb[, 2],
+  AUC    = as.numeric(auc_vec)
+)
+
+par(mar = c(4, 4, 2, 1))
+pal    <- colorRampPalette(c("#FFFFBF", "#FDAE61", "#D7191C"))
+nCols  <- 100
+cols   <- pal(nCols)
+
+auc_range  <- range(df$AUC, na.rm = TRUE)
+auc_breaks <- seq(auc_range[1], auc_range[2], length.out = nCols)
+col_index  <- findInterval(df$AUC, auc_breaks, all.inside = TRUE)
+pt_cols    <- cols[col_index]
+
+plot(df$UMAP_1, df$UMAP_2,
+     col  = pt_cols,
+     pch  = 16,
+     cex  = 1.2,
+     main = reg,
+     xlab = "UMAP_1",
+     ylab = "UMAP_2")
+
+```
+
+Let's take a look to the appereance of the genes in a Heatmap.
+
+```{r}
+
+library(pheatmap)
+
+# 1) Select some informative regulons (active between 5% and 80% of the cells)
+      frac_active <- rowMeans(regulonBin_mat)   
+      selRegs <- names(which(frac_active > 0.05 & frac_active < 0.8))
+      mat_bin <- regulonBin_mat[selRegs, , drop = FALSE]
+
+
+# 2) collect al the metadata to add to the plot
+      meta_sub <- meta[colnames(mat_bin), , drop = FALSE]
+      annotation_col <- data.frame(
+        cell_type_vs = meta_sub$cell_type_vs,
+        sex          = meta_sub$sex
+      )
+      rownames(annotation_col) <- colnames(mat_bin)
+      cell_order <- order(annotation_col$cell_type_vs)
+
+
+#Plot the heatmap of regulon activity
+bin<-pheatmap(
+        mat_bin[, cell_order],
+        cluster_rows   = TRUE,
+        cluster_cols   = FALSE,
+        show_rownames  = TRUE,
+        show_colnames  = FALSE,
+        scale          = "none",               # ya es 0/1
+        annotation_col = annotation_col,
+        color          = c("white", "black")   # opcional: 0 = blanco, 1 = negro
+      )
+print(bin)
+
+```
+
+Let's take a look to the appereance of a small network with basic graph settings:
+
+```{r}
+  library(dplyr)
+  library(igraph)
+  library(ggraph)
+  library(ggplot2)
+# 1) Build regulon edge list (TF -> target)
+edges_grn <- data.frame(
+  source = rep(names(regulons), lengths(regulons)),
+  target = unlist(regulons, use.names = FALSE),
+  stringsAsFactors = FALSE
+) %>%
+  distinct()
+
+# 2) Add GENIE3 weights
+edges_grn <- edges_grn %>%
+  left_join(linkList %>% transmute(source = regulatoryGene, target = targetGene, weight = weight), by = c("source", "target"))
+
+
+# 3) Keep only TF -> TF edges
+edges_tf <- edges_grn %>%
+  filter(source %in% tfList, target %in% tfList)
+
+# 5) Build igraph object
+nodes_tf <- data.frame(
+  node = sort(unique(c(edges_tf$source, edges_tf$target))),
+  stringsAsFactors = FALSE
+) %>%
+  mutate(is_TF = TRUE, node_type = "TF")
+
+g <- graph_from_data_frame(
+  d = edges_tf %>% mutate(weight = as.numeric(weight)),
+  vertices = nodes_tf,
+  directed = TRUE
+)
+
+# 6) Node metrics used for plotting
+V(g)$out_degree <- degree(g, mode = "out")
+
+# 7) Annotated labels (ID -> symbol)
+V(g)$label <- ifelse(V(g)$name %in% names(gene_map), gene_map[V(g)$name], V(g)$name)
+
+# 8) Subgraph: top TF hubs + their 1-step outgoing neighbors
+
+
+tf_idx <- which(V(g)$is_TF)
+
+top_idx <- tf_idx[order(V(g)$out_degree[tf_idx], decreasing = TRUE)]
+top_idx <- head(top_idx, 15)
+
+top_tfs <- V(g)$name[top_idx]
+
+nbrs <- unlist(neighborhood(g, order = 1, nodes = top_tfs, mode = "out"))
+keep <- unique(c(top_tfs, V(g)$name[nbrs]))
+
+g_sub <- induced_subgraph(g, vids = V(g)[name %in% keep])
+
+net <- ggraph(g_sub, layout = "fr") +
+  geom_edge_link(aes(alpha = weight), show.legend = FALSE) +
+  geom_node_point(aes(size = out_degree), show.legend = TRUE) +
+  geom_node_text(aes(label = label), repel = TRUE, size = 3) +
+  theme_void()
+
+print(net)
+
+
+```
